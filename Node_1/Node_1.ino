@@ -12,7 +12,7 @@ void loop();
 #define USE_MPU6050 false
 
 // Solar Tracker Servo Motor
-Servo solarServo;
+Servo solarServo;4
 
 // =====================================================
 // NODE IDENTIFICATION

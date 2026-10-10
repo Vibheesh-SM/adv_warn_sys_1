@@ -1,225 +1,208 @@
+#include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
-#include <Wire.h>
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
-#include <ESP32Servo.h>
-#include <math.h>
+#include <esp_wifi.h>
 
-Adafruit_MPU6050 mpu;
-Servo warningServo;
+void setup();
+void loop();
 
-// =====================================================
-// NODE IDENTIFICATION
-// =====================================================
 const uint8_t NODE_ID = 3;
 
-// ESP-NOW Broadcast Address (transmits to any receiving Gateway)
-uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+uint8_t broadcastAddress[] = {
+  0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+};
 
-// =====================================================
-// DATA PACKET STRUCTURE (MATCHES CENTRAL GATEWAY)
-// =====================================================
 typedef struct __attribute__((packed)) {
-  uint8_t nodeId;         // Node ID (1 to 4)
-  uint16_t potValue;      // Soil Crack / Ground Displacement (0-4095)
-  uint8_t vibrationValue; // SW-420 Shock (0 or 1)
-  uint16_t lightValue;    // LDR Light level (0-4095)
-  uint16_t soilValue;     // Soil Moisture Saturation (0-4095)
-  float acceleration;     // Total acceleration vector (m/s^2)
-  float pitch;            // Slope Pitch Angle (deg)
-  float roll;             // Slope Roll Angle (deg)
-  uint16_t batteryMv;     // Battery Voltage in mV (e.g. 3700-4200)
-  uint8_t signalCount;    // Number of triggered anomaly thresholds
-  uint8_t abnormal;       // 1 if Abnormal, 0 if Normal
+  uint8_t nodeId;
+  uint16_t potValue;
+  uint8_t vibrationValue;
+  uint16_t lightValue;
+  uint16_t soilValue;
+  float acceleration;
+  float pitch;
+  float roll;
+  uint16_t batteryMv;
+  uint8_t signalCount;
+  uint8_t abnormal;
 } NodeDataPacket;
 
-// =====================================================
-// PIN DEFINITIONS
-// =====================================================
-const int potPin = 34;       // Ground Crack / Potentiometer
-const int vibrationPin = 35; // SW-420 Shock / Vibration Sensor
-const int ldrPin = 32;       // LDR Light Sensor
-const int soilPin = 33;      // Soil Moisture Sensor
-const int batteryPin = 36;   // Battery Voltage ADC Input (VP Pin)
+const int potPin       = 34;
+const int vibrationPin = 35;
+const int ldrPin       = 25;
+const int soilPin      = 33;
+const int batteryPin   = 36;
 
-const int ledPin = 2;        // Local LED Indicator
-const int buzzerPin = 4;     // Local Alarm Buzzer
-const int servoPin = 27;     // Warning Flag Servo Motor
+const int ledPin        = 13;
+const int onboardLedPin = 2;
+const int buzzerPin     = 4;
+const int servoPin      = 27;
 
-// =====================================================
-// THRESHOLDS & SETTINGS
-// =====================================================
 const int POT_THRESHOLD = 2500;
 const int SOIL_THRESHOLD = 2500;
-const float ACCELERATION_THRESHOLD = 12.0; // m/s^2
-const int REQUIRED_SIGNALS = 2; // Need 2 or more signals to trigger Abnormal
+const float ACCELERATION_THRESHOLD = 12.0;
 
-const int SERVO_NORMAL = 0;
-const int SERVO_WARNING = 90;
+int currentSolarAngle = -1;
 
-// Enable Deep Sleep mode (set true for ultra-low power battery operation)
-const bool ENABLE_DEEP_SLEEP = false; 
+bool useManualSerialPot = false;
+int manualPotValue = 500;
 
-// =====================================================
-// ESP-NOW SEND CALLBACK
-// =====================================================
-void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  Serial.print("ESP-NOW Packet Send Status: ");
-  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "SUCCESS" : "FAIL");
+void checkSerialInput() {
+  if (Serial.available() > 0) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+
+    if (input.equalsIgnoreCase("auto")) {
+      useManualSerialPot = false;
+      Serial.println("mode: physical potentiometer knob");
+    } else {
+      int val = input.toInt();
+      if (val >= 0 && val <= 4095) {
+        useManualSerialPot = true;
+        manualPotValue = val;
+        Serial.printf("manual override: set potentiometer to %d / 4095\n", manualPotValue);
+      }
+    }
+  }
 }
 
-// =====================================================
-// SETUP
-// =====================================================
+int readAnalogSmoothed(int pin, int samples = 32) {
+  long sum = 0;
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(pin);
+    delayMicroseconds(50);
+  }
+  return sum / samples;
+}
+
+float filteredPot = -1.0;
+
+int getFilteredPotValue(int pin) {
+  int raw = readAnalogSmoothed(pin, 32);
+  if (filteredPot < 0) {
+    filteredPot = raw;
+  } else {
+    filteredPot = (0.2f * raw) + (0.8f * filteredPot);
+  }
+  return (int)filteredPot;
+}
+
+// zero dependency servo driver
+void moveServoAngle(int pin, int targetAngle) {
+  pinMode(pin, OUTPUT);
+  int pulseUs = map(constrain(targetAngle, 0, 180), 0, 180, 500, 2400);
+  for (int i = 0; i < 20; i++) {
+    digitalWrite(pin, HIGH);
+    delayMicroseconds(pulseUs);
+    digitalWrite(pin, LOW);
+    delayMicroseconds(20000 - pulseUs);
+  }
+  digitalWrite(pin, LOW);
+}
+
+void adjustSolarPanelAngle(int lightLevel) {
+  int targetAngle = (lightLevel == HIGH) ? 120 : 60;
+  targetAngle = constrain(targetAngle, 0, 180);
+
+  if (currentSolarAngle == targetAngle)
+    return;
+
+  moveServoAngle(servoPin, targetAngle);
+  currentSolarAngle = targetAngle;
+}
+
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+}
+
+// buzzer control (inverted for 5v direct drive)
+void soundAlarmBuzzer(bool enable) {
+  // true pulls pin low to sink current
+  digitalWrite(buzzerPin, enable ? LOW : HIGH);
+}
+
 void setup() {
   Serial.begin(115200);
   delay(500);
 
-  Serial.println();
-  Serial.println("=========================================");
-  Serial.printf("         SENSOR NODE %d ONLINE          \n", NODE_ID);
-  Serial.println("   ESP-NOW + DSP Tilt + Battery Monitor  ");
-  Serial.println("=========================================");
+  Serial.printf("sensor node %d online\n", NODE_ID);
 
-  // Pin Configuration
-  pinMode(vibrationPin, INPUT);
+  pinMode(potPin, INPUT);
+  pinMode(vibrationPin, INPUT_PULLDOWN);
+  pinMode(ldrPin, INPUT);
   pinMode(ledPin, OUTPUT);
+  pinMode(onboardLedPin, OUTPUT);
+  
   pinMode(buzzerPin, OUTPUT);
-  digitalWrite(ledPin, LOW);
-  digitalWrite(buzzerPin, LOW);
+  digitalWrite(buzzerPin, HIGH);
 
-  // Servo Setup
-  warningServo.setPeriodHertz(50);
-  warningServo.attach(servoPin, 500, 2400);
-  warningServo.write(SERVO_NORMAL);
+  moveServoAngle(servoPin, 90);
+  currentSolarAngle = 90;
 
-  // Wire & MPU6050 Setup
-  Wire.begin();
-  if (!mpu.begin()) {
-    Serial.println("ERROR: MPU6050 Sensor Not Found!");
-  } else {
-    Serial.println("MPU6050 Sensor Connected Successfully!");
-    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
-    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
-  }
-
-  // Wi-Fi Station Mode for ESP-NOW
   WiFi.mode(WIFI_STA);
-  Serial.print("Node MAC Address: ");
-  Serial.println(WiFi.macAddress());
+  WiFi.disconnect();
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
 
-  // Initialize ESP-NOW
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("ERROR: ESP-NOW Initialization Failed!");
-    return;
-  }
-  esp_now_register_send_cb(onDataSent);
-
-  // Register ESP-NOW Peer
-  esp_now_peer_info_t peerInfo;
-  memset(&peerInfo, 0, sizeof(peerInfo));
-  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
-  peerInfo.channel = 0;
-  peerInfo.encrypt = false;
-
-  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-    Serial.println("Failed to add ESP-NOW peer!");
-  } else {
-    Serial.println("ESP-NOW Peer Added Successfully!");
+  if (esp_now_init() == ESP_OK) {
+    esp_now_register_send_cb((esp_now_send_cb_t)onDataSent);
+    
+    esp_now_peer_info_t peerInfo;
+    memset(&peerInfo, 0, sizeof(peerInfo));
+    memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+    peerInfo.channel = 1;
+    peerInfo.encrypt = false;
+    
+    esp_now_add_peer(&peerInfo);
   }
 }
 
-// =====================================================
-// MAIN LOOP
-// =====================================================
 void loop() {
-  // 1. Read Analog & Digital Sensors
-  int potValue = analogRead(potPin);
-  int vibrationValue = digitalRead(vibrationPin);
-  int lightValue = analogRead(ldrPin);
-  int soilValue = analogRead(soilPin);
+  checkSerialInput();
 
-  // Battery Voltage Calculation (Divider ratio ~ 2:1 on ADC pin)
-  int rawBat = analogRead(batteryPin);
-  uint16_t batteryMv = map(rawBat, 0, 4095, 0, 3300) * 2; // Approx mV (e.g. 4100 mV)
-  if (batteryMv < 2500) batteryMv = 3990; // Fallback default for unpopulated divider
+  int potValue = useManualSerialPot ? manualPotValue : getFilteredPotValue(potPin);
 
-  // 2. Read MPU6050 IMU Data
-  sensors_event_t a, g, temp;
-  mpu.getEvent(&a, &g, &temp);
+  int restingState = digitalRead(vibrationPin);
+  int vibrationValue = 0;
+  for (int i = 0; i < 15; i++) {
+    if (digitalRead(vibrationPin) != restingState) {
+      vibrationValue = 1;
+      break;
+    }
+    delay(2);
+  }
 
-  // Total Acceleration Vector Magnitude (m/s^2)
-  float acceleration = sqrt(
-    a.acceleration.x * a.acceleration.x +
-    a.acceleration.y * a.acceleration.y +
-    a.acceleration.z * a.acceleration.z
-  );
+  int lightValue = digitalRead(ldrPin);
+  int soilValue = readAnalogSmoothed(soilPin, 16);
 
-  // DSP Pitch and Roll Tilt Angle Calculation (Degrees)
-  float pitch = atan2(a.acceleration.y, sqrt(a.acceleration.x * a.acceleration.x + a.acceleration.z * a.acceleration.z)) * 180.0 / M_PI;
-  float roll  = atan2(-a.acceleration.x, a.acceleration.z) * 180.0 / M_PI;
+  adjustSolarPanelAngle(lightValue);
 
-  // 3. Threshold Evaluation
-  bool groundMovement    = (potValue > POT_THRESHOLD);
-  bool vibrationDetected = (vibrationValue == HIGH);
-  bool wetSoil           = (soilValue > SOIL_THRESHOLD);
-  bool mpuMovement       = (acceleration > ACCELERATION_THRESHOLD);
-
-  int signalCount = 0;
-  if (groundMovement) signalCount++;
-  if (vibrationDetected) signalCount++;
-  if (wetSoil) signalCount++;
-  if (mpuMovement) signalCount++;
-
-  bool abnormal = (signalCount >= REQUIRED_SIGNALS);
-
-  // 4. Local Actuator Signals
-  if (abnormal) {
-    digitalWrite(ledPin, HIGH);
-    digitalWrite(buzzerPin, HIGH);
-    warningServo.write(SERVO_WARNING);
+  bool potTriggered = (potValue >= POT_THRESHOLD);
+  
+  if (potTriggered) {
+    soundAlarmBuzzer(true);
+    digitalWrite(onboardLedPin, HIGH);
+    digitalWrite(ledPin, HIGH);    
   } else {
+    soundAlarmBuzzer(false);
+    digitalWrite(onboardLedPin, LOW);
     digitalWrite(ledPin, LOW);
-    digitalWrite(buzzerPin, LOW);
-    warningServo.write(SERVO_NORMAL);
   }
 
-  // 5. Construct & Send ESP-NOW Packet
   NodeDataPacket packet;
-  packet.nodeId = NODE_ID;
-  packet.potValue = potValue;
-  packet.vibrationValue = vibrationValue;
-  packet.lightValue = lightValue;
-  packet.soilValue = soilValue;
-  packet.acceleration = acceleration;
-  packet.pitch = pitch;
-  packet.roll = roll;
-  packet.batteryMv = batteryMv;
-  packet.signalCount = signalCount;
-  packet.abnormal = abnormal ? 1 : 0;
+  packet.nodeId         = NODE_ID;
+  packet.potValue       = (uint16_t)potValue;
+  packet.vibrationValue = (uint8_t)vibrationValue;
+  packet.lightValue     = (uint16_t)(lightValue == HIGH ? 4095 : 100);
+  packet.soilValue      = (uint16_t)soilValue;
+  packet.acceleration   = 9.81f;
+  packet.pitch          = 0.0f;
+  packet.roll           = 0.0f;
+  packet.batteryMv      = 3700;
+  packet.signalCount    = potTriggered ? 1 : 0;
+  packet.abnormal       = potTriggered ? 1 : 0;
 
-  esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *)&packet, sizeof(packet));
+  esp_now_send(broadcastAddress, (uint8_t *)&packet, sizeof(packet));
 
-  // 6. Serial Debug Output
-  Serial.println("\n-----------------------------------------");
-  Serial.printf("NODE %d TELEMETRY REPORT\n", NODE_ID);
-  Serial.printf("Pot: %d | Vib: %d | Soil: %d | Acc: %.2f m/s^2\n", potValue, vibrationValue, soilValue, acceleration);
-  Serial.printf("Pitch Tilt: %.1f° | Roll Tilt: %.1f° | Battery: %d mV\n", pitch, roll, batteryMv);
-  Serial.printf("Signal Count: %d | Status: %s | ESP-NOW Result: %s\n", 
-                signalCount, abnormal ? "ABNORMAL" : "NORMAL", result == ESP_OK ? "SENT OK" : "SEND ERROR");
-  Serial.println("-----------------------------------------");
+  Serial.printf("node %d | pot: %d | ldr: %d | soil: %d | alarm: %s\n", 
+                NODE_ID, potValue, lightValue, soilValue, potTriggered ? "active" : "off");
 
-  // 7. Battery Power Management (Deep Sleep optional)
-  if (ENABLE_DEEP_SLEEP) {
-    // Wake up on SW-420 shock interrupt or after 30 seconds
-    esp_sleep_enable_ext0_wakeup((gpio_num_t)vibrationPin, HIGH);
-    esp_sleep_enable_timer_wakeup(30 * 1000000ULL);
-    Serial.println("Entering Deep Sleep (~15uA)...");
-    esp_deep_sleep_start();
-  }
-
-  delay(2000);
+  delay(200);
 }
-
