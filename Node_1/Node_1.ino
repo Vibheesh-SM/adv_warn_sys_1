@@ -25,7 +25,7 @@ uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 // =====================================================
 // DATA PACKET STRUCTURE (MATCHES CENTRAL GATEWAY EXACTLY)
 // =====================================================
-struct NodeDataPacket {
+typedef struct __attribute__((packed)) {
   uint8_t nodeId;         // Node ID (1 to 4)
   uint16_t potValue;      // Soil Crack / Ground Displacement (0-4095)
   uint8_t vibrationValue; // SW-420 Shock (0 or 1)
@@ -37,7 +37,7 @@ struct NodeDataPacket {
   uint16_t batteryMv;     // Battery Voltage in mV (e.g. 3700-4200)
   uint8_t signalCount;    // Number of triggered anomaly thresholds
   uint8_t abnormal;       // 1 if Abnormal, 0 if Normal
-};
+} NodeDataPacket;
 
 // =====================================================
 // PIN DEFINITIONS (Check your physical wiring against these!)
