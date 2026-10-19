@@ -86,17 +86,30 @@ int getFilteredPotValue(int pin) {
   return (int)filteredPot;
 }
 
-// zero dependency servo driver
+// Hardware LEDC PWM Servo Driver (50Hz standard servo control)
+const int SERVO_PWM_CHANNEL = 4;
+const int SERVO_PWM_FREQ = 50;
+const int SERVO_PWM_RES = 16; // 16-bit resolution (0-65535, ~20ms period)
+
+void initServoPWM(int pin) {
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+  ledcAttach(pin, SERVO_PWM_FREQ, SERVO_PWM_RES);
+#else
+  ledcSetup(SERVO_PWM_CHANNEL, SERVO_PWM_FREQ, SERVO_PWM_RES);
+  ledcAttachPin(pin, SERVO_PWM_CHANNEL);
+#endif
+}
+
 void moveServoAngle(int pin, int targetAngle) {
-  pinMode(pin, OUTPUT);
-  int pulseUs = map(constrain(targetAngle, 0, 180), 0, 180, 500, 2400);
-  for (int i = 0; i < 20; i++) {
-    digitalWrite(pin, HIGH);
-    delayMicroseconds(pulseUs);
-    digitalWrite(pin, LOW);
-    delayMicroseconds(20000 - pulseUs);
-  }
-  digitalWrite(pin, LOW);
+  int angle = constrain(targetAngle, 0, 180);
+  int pulseUs = map(angle, 0, 180, 500, 2400);
+  uint32_t duty = (uint32_t)(((uint64_t)pulseUs * 65535ULL) / 20000ULL);
+
+#if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
+  ledcWrite(pin, duty);
+#else
+  ledcWrite(SERVO_PWM_CHANNEL, duty);
+#endif
 }
 
 void adjustSolarPanelAngle(int lightLevel) {
@@ -134,6 +147,7 @@ void setup() {
   pinMode(buzzerPin, OUTPUT);
   digitalWrite(buzzerPin, HIGH);
 
+  initServoPWM(servoPin);
   moveServoAngle(servoPin, 90);
   currentSolarAngle = 90;
 
